@@ -43,8 +43,15 @@ void Packet::Init(int arg_link_type, struct timeval *arg_ts, uint32 arg_caplen,
 	l3_proto = L3_UNKNOWN;
 	eth_type = 0;
 	vlan = 0;
+	inner_vlan = 0;
 
 	l2_valid = false;
+
+	if ( data && cap_len < hdr_size )
+		{
+		Weird("truncated_link_header");
+		return;
+		}
 
 	if ( data )
 		ProcessLayer2();
@@ -93,6 +100,7 @@ void Packet::ProcessLayer2()
 	bool have_mpls = false;
 
 	const u_char* pdata = data;
+	const u_char* end_of_data = data + cap_len;
 
 	switch ( link_type ) {
 	case DLT_NULL:
@@ -139,6 +147,12 @@ void Packet::ProcessLayer2()
 			// 802.1q / 802.1ad
 			case 0x8100:
 			case 0x9100:
+				if ( pdata + 4 >= end_of_data )
+					{
+					Weird("truncated_link_header");
+					return;
+					}
+
 				vlan = ((pdata[0] << 8) + pdata[1]) & 0xfff;
 				protocol = ((pdata[2] << 8) + pdata[3]);
 				pdata += 4; // Skip the vlan header
@@ -153,6 +167,13 @@ void Packet::ProcessLayer2()
 				// Check for double-tagged (802.1ad)
 				if ( protocol == 0x8100 || protocol == 0x9100 )
 					{
+					if ( pdata + 4 >= end_of_data )
+						{
+						Weird("truncated_link_header");
+						return;
+						}
+
+					inner_vlan = ((pdata[0] << 8) + pdata[1]) & 0xfff;
 					protocol = ((pdata[2] << 8) + pdata[3]);
 					pdata += 4; // Skip the vlan header
 					}
@@ -162,6 +183,12 @@ void Packet::ProcessLayer2()
 
 			// PPPoE carried over the ethernet frame.
 			case 0x8864:
+				if ( pdata + 8 >= end_of_data )
+					{
+					Weird("truncated_link_header");
+					return;
+					}
+
 				protocol = (pdata[6] << 8) + pdata[7];
 				pdata += 8; // Skip the PPPoE session and PPP header
 
@@ -228,6 +255,12 @@ void Packet::ProcessLayer2()
 		{
 		// Assume we're pointing at IP. Just figure out which version.
 		pdata += GetLinkHeaderSize(link_type);
+		if ( pdata + sizeof(struct ip) >= end_of_data )
+			{
+			Weird("truncated_link_header");
+			return;
+			}
+
 		const struct ip* ip = (const struct ip *)pdata;
 
 		if ( ip->ip_v == 4 )
@@ -252,18 +285,18 @@ void Packet::ProcessLayer2()
 
 		while ( ! end_of_stack )
 			{
-			end_of_stack = *(pdata + 2) & 0x01;
-			pdata += 4;
-
-			if ( pdata >= pdata + cap_len )
+			if ( pdata + 4 >= end_of_data )
 				{
-				Weird("no_mpls_payload");
+				Weird("truncated_link_header");
 				return;
 				}
+
+			end_of_stack = *(pdata + 2) & 0x01;
+			pdata += 4;
 			}
 
 		// We assume that what remains is IP
-		if ( pdata + sizeof(struct ip) >= data + cap_len )
+		if ( pdata + sizeof(struct ip) >= end_of_data )
 			{
 			Weird("no_ip_in_mpls_payload");
 			return;
@@ -286,12 +319,13 @@ void Packet::ProcessLayer2()
 	else if ( encap_hdr_size )
 		{
 		// Blanket encapsulation. We assume that what remains is IP.
-		pdata += encap_hdr_size;
-		if ( pdata + sizeof(struct ip) >= data + cap_len )
+		if ( pdata + encap_hdr_size + sizeof(struct ip) >= end_of_data )
 			{
 			Weird("no_ip_left_after_encap");
 			return;
 			}
+
+		pdata += encap_hdr_size;
 
 		const struct ip* ip = (const struct ip *)pdata;
 
@@ -308,9 +342,8 @@ void Packet::ProcessLayer2()
 
 		}
 
-	// We've now determined (a) L3_IPV4 vs (b) L3_IPV6 vs
-	// (c) L3_ARP vs (d) L3_UNKNOWN.
-	l3_proto = l3_proto;
+	// We've now determined (a) L3_IPV4 vs (b) L3_IPV6 vs (c) L3_ARP vs
+	// (d) L3_UNKNOWN.
 
 	// Calculate how much header we've used up.
 	hdr_size = (pdata - data);
@@ -350,6 +383,7 @@ RecordVal* Packet::BuildPktHdrVal() const
 	//      src: string &optional;  ##< L2 source (if ethernet)
 	//      dst: string &optional;  ##< L2 destination (if ethernet)
 	//      vlan: count &optional;  ##< VLAN tag if any (and ethernet)
+	//      inner_vlan: count &optional;  ##< Inner VLAN tag if any (and ethernet)
 	//      ethertype: count &optional; ##< If ethernet
 	//      proto: layer3_proto;    ##< L3 proto
 
@@ -364,7 +398,10 @@ RecordVal* Packet::BuildPktHdrVal() const
 		if ( vlan )
 			l2_hdr->Assign(5, new Val(vlan, TYPE_COUNT));
 
-		l2_hdr->Assign(6, new Val(eth_type, TYPE_COUNT));
+		if ( inner_vlan )
+			l2_hdr->Assign(6, new Val(inner_vlan, TYPE_COUNT));
+
+		l2_hdr->Assign(7, new Val(eth_type, TYPE_COUNT));
 
 		if ( eth_type == ETHERTYPE_ARP || eth_type == ETHERTYPE_REVARP )
 			// We also identify ARP for L3 over ethernet
@@ -376,7 +413,7 @@ RecordVal* Packet::BuildPktHdrVal() const
 	l2_hdr->Assign(1, new Val(len, TYPE_COUNT));
 	l2_hdr->Assign(2, new Val(cap_len, TYPE_COUNT));
 
-	l2_hdr->Assign(7, new EnumVal(l3, BifType::Enum::layer3_proto));
+	l2_hdr->Assign(8, new EnumVal(l3, BifType::Enum::layer3_proto));
 
 	pkt_hdr->Assign(0, l2_hdr);
 
